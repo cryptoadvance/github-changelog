@@ -16,8 +16,8 @@ PUBLIC_GITHUB_URL = 'https://github.com'
 PUBLIC_GITHUB_API_URL = 'https://api.github.com'
 GitHubConfig = namedtuple('GitHubConfig', ['base_url', 'api_url', 'headers'])
 
-Commit = namedtuple('Commit', ['sha', 'message'])
-PullRequest = namedtuple('PullRequest', ['number', 'title'])
+Commit = namedtuple('Commit', ['sha', 'message', 'author'])
+PullRequest = namedtuple('PullRequest', ['number', 'title', 'author'])
 
 # Merge commits use a double linebreak between the branch name and the title
 MERGE_PR_RE = re.compile(r'^Merge pull request #([0-9]+) from .*\n\n(.*)')
@@ -67,6 +67,8 @@ def get_commit_for_tag(github_config, owner, repo, tag):
 
     return tag_json['object']['sha']
 
+def get_commit(commit):
+    return commit
 
 def get_last_commit(github_config, owner, repo, branch='main'):
     """ Get the last commit sha for the given repo and branch """
@@ -76,7 +78,7 @@ def get_last_commit(github_config, owner, repo, branch='main'):
         owner, repo,
         'commits'
     ])
-    commits_response = requests.get(commits_url, params={'sha': 'main'},
+    commits_response = requests.get(commits_url, params={'sha': branch},
                                     headers=github_config.headers)
     commits_json = commits_response.json()
     if commits_response.status_code != 200:
@@ -104,7 +106,7 @@ def get_commits_between(github_config, owner, repo, first_commit, last_commit):
         'compare',
         first_commit + '...' + last_commit
     ])
-    commits_response = requests.get(commits_url, params={'sha': 'main'},
+    commits_response = requests.get(commits_url, params={'sha': 'master'},
                                     headers=github_config.headers)
     commits_json = commits_response.json()
     if commits_response.status_code != 200:
@@ -115,7 +117,7 @@ def get_commits_between(github_config, owner, repo, first_commit, last_commit):
         raise GitHubError("Commits not found between {} and {}.".format(
             first_commit, last_commit))
 
-    commits = [Commit(c['sha'], c['commit']['message'])
+    commits = [Commit(c['sha'], c['commit']['message'], c['commit']['author']['name'])
                for c in commits_json['commits']]
     return commits
 
@@ -125,27 +127,31 @@ def is_pr(message):
     return MERGE_PR_RE.search(message) or SQUASH_PR_RE.search(message)
 
 
-def extract_pr(message):
+def extract_pr(message, author):
     """ Given a PR merge commit message, extract the PR number and title """
     merge_match = MERGE_PR_RE.match(message)
     squash_match = SQUASH_PR_RE.match(message)
 
     if merge_match is not None:
         number, title = merge_match.groups()
-        return PullRequest(number=number, title=title)
+        return PullRequest(number=number, title=title, author=author)
     elif squash_match is not None:
         title, number = squash_match.groups()
-        return PullRequest(number=number, title=title)
+        return PullRequest(number=number, title=title, author=author)
 
     raise Exception("Commit isn't a PR merge, {}".format(message))
 
 
 def fetch_changes(github_config, owner, repo, previous_tag=None,
                   current_tag=None, branch='main'):
-    if previous_tag is None:
-        previous_tag = get_last_tag(github_config, owner, repo)
-    previous_commit = get_commit_for_tag(github_config, owner, repo,
-                                         previous_tag)
+    
+    try:
+        if previous_tag is None:
+            previous_tag = get_last_tag(github_config, owner, repo)
+        previous_commit = get_commit_for_tag(github_config, owner, repo,
+                                            previous_tag)
+    except:
+        previous_commit = get_commit(previous_tag) # might be a commit-hash
 
     current_commit = None
     if current_tag is not None:
@@ -158,7 +164,7 @@ def fetch_changes(github_config, owner, repo, previous_tag=None,
                                           previous_commit, current_commit)
 
     # Process the commit list looking for PR merges
-    prs = [extract_pr(c.message) for c in commits_between if is_pr(c.message)]
+    prs = [extract_pr(c.message, c.author) for c in commits_between if is_pr(c.message)]
 
     if len(prs) == 0 and len(commits_between) > 0:
         raise Exception("Lots of commits and no PRs on branch {}".format(
@@ -173,26 +179,26 @@ def format_changes(github_config, owner, repo, prs, markdown=False):
     lines = []
     for pr in prs:
         number = '#{number}'.format(number=pr.number)
+        author = pr.author
         if markdown:
             link = '{github_url}/{owner}/{repo}/pull/{number}'.format(
                 github_url=github_config.base_url, owner=owner, repo=repo,
                 number=pr.number)
             number = '[{number}]({link})'.format(number=number, link=link)
 
-        lines.append('- {title} {number}'.format(title=pr.title,
-                                                 number=number))
+        lines.append(f'- {pr.title} {number} ({author})')
 
     return lines
 
 
 def generate_changelog(owner, repo, previous_tag=None, current_tag=None,
                        markdown=False, single_line=False, github_base_url=None,
-                       github_api_url=None, github_token=None):
+                       github_api_url=None, github_token=None, branch="main"):
 
     github_config = get_github_config(github_base_url, github_api_url,
                                       github_token)
 
-    prs = fetch_changes(github_config, owner, repo, previous_tag, current_tag)
+    prs = fetch_changes(github_config, owner, repo, previous_tag, current_tag, branch=branch)
     lines = format_changes(github_config, owner, repo, prs, markdown=markdown)
 
     separator = '\\n' if single_line else '\n'
@@ -226,6 +232,8 @@ def main():
     parser.add_argument('--github-token', type=str, action='store',
                         default=None, help='GitHub oauth token to auth '
                         'your Github requests with')
+    parser.add_argument('--branch', type=str, action='store',
+                    default="main", help='The branch to operate on')
 
     args = parser.parse_args()
 
